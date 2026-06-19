@@ -81,8 +81,16 @@
     color:var(--muted);background:rgba(14,14,16,.6);padding:6px 9px;border-radius:6px;
     backdrop-filter:blur(6px);pointer-events:none}
   .meta .name{color:var(--text)}
-  .badge{position:absolute;top:14px;right:14px;z-index:5;font-family:var(--mono);font-size:11px;
+  .badge{position:absolute;top:14px;left:14px;z-index:5;font-family:var(--mono);font-size:11px;
     letter-spacing:.1em;text-transform:uppercase;padding:5px 9px;border-radius:6px;font-weight:600}
+  /* orientation tool */
+  .orient{position:absolute;top:14px;right:14px;z-index:7;display:flex;gap:3px;
+    background:rgba(14,14,16,.62);backdrop-filter:blur(6px);border-radius:7px;padding:4px}
+  .orient button{background:transparent;border:0;color:var(--muted);width:28px;height:24px;
+    border-radius:5px;font-size:15px;line-height:1;display:flex;align-items:center;justify-content:center}
+  .orient button:hover{background:var(--panel-2);color:var(--text)}
+  .orient .lock.on{color:var(--pick)}
+  .orient .sep{width:1px;background:var(--line);margin:2px 1px}
   .badge.pick{background:var(--pick);color:#06301a} .badge.reject{background:var(--reject);color:#3a0a0e}
 
   /* empty / loading state */
@@ -175,6 +183,12 @@
     <div class="flagbar" id="flagbar"></div>
     <img id="photo" alt="" hidden draggable="false">
     <div class="badge" id="badge" hidden></div>
+    <div class="orient" id="orient" hidden>
+      <button id="rotL" title="Rotate left (R)">↺</button>
+      <button id="rotR" title="Rotate right">↻</button>
+      <span class="sep"></span>
+      <button id="rotLock" class="lock" title="Lock this orientation for every photo">🔓</button>
+    </div>
     <div class="meta" id="meta" hidden><span class="name" id="metaName"></span> <span id="metaPos"></span></div>
     <div class="minimap" id="minimap" hidden><img id="mmImg" alt="" draggable="false"><div class="mmview" id="mmView"></div></div>
   </div>
@@ -196,6 +210,7 @@
       <kbd>scroll</kbd><dd>Vertical scrolls the gallery · horizontal zooms the photo</dd>
       <kbd>lock</kbd><dd>Zoom level + spot carry to the next photo (Esc to release)</dd>
       <kbd>G</kbd><dd>Toggle grid / single view</dd>
+      <kbd>R</kbd> / <kbd>⇧R</kbd><dd>Rotate right / left (top-right tool; lock 🔒 applies to all)</dd>
       <kbd>Esc</kbd><dd>Stop zoom (clears the locked level) or exit grid</dd>
     </dl>
     <button class="btn close" id="btnCloseHelp">Close</button>
@@ -221,6 +236,7 @@ let zoom={on:false,scale:1,tx:0,ty:0,max:1,one:1,_b:null,
           dragging:false,moved:false,startX:0,startY:0,startTx:0,startTy:0};
 let stick={scale:1,fx:.5,fy:.5};   // sticky zoom carried across images (1 = off)
 let showSeq=0;                     // guards against stale async show() finishing late
+let rotLock=false, rotLockVal=0;   // manual orientation override (quarter-turns, 0..3) locked to all photos
 
 /* ---------- folder open & enumeration ---------- */
 async function openFolder(){
@@ -241,7 +257,7 @@ async function openFolder(){
   for(const b of ['btnGrid','btnMove','btnDel']) $(b).disabled = allItems.length===0;
   buildFolderList();
   if(allItems.length) selectFolder(folders[0].path);
-  else { film.classList.add('hidden'); updateCounts(); }
+  else { film.classList.add('hidden'); $('orient').hidden=true; updateCounts(); }
 }
 
 /* ---------- folder sidebar ---------- */
@@ -359,6 +375,34 @@ async function orientToUrl(blob, o){
   }catch(e){ return URL.createObjectURL(blob); }
 }
 
+/* ---------- manual orientation override (for files whose EXIF we can't read,
+   e.g. Fujifilm RAF) — rotate the already-oriented preview by quarter turns
+   and bake it into a fresh blob so zoom/minimap keep working unchanged. ----- */
+function effectiveRot(item){ return ((rotLock?rotLockVal:(item&&item.rot||0))%4+4)%4; }
+async function rotateUrl(srcUrl, q){
+  const blob=await (await fetch(srcUrl)).blob();
+  const bmp=await createImageBitmap(blob);
+  const w=bmp.width, h=bmp.height, swap=q%2===1;
+  const cv=document.createElement('canvas');
+  cv.width=swap?h:w; cv.height=swap?w:h;
+  const x=cv.getContext('2d');
+  x.translate(cv.width/2, cv.height/2); x.rotate(q*Math.PI/2); x.drawImage(bmp,-w/2,-h/2);
+  if(bmp.close) bmp.close();
+  return URL.createObjectURL(await new Promise(r=>cv.toBlob(r,'image/jpeg',0.92)));
+}
+async function displayUrl(item, baseUrl){
+  const q=effectiveRot(item);
+  if(!baseUrl || baseUrl==='NONE' || q===0){
+    if(item._rot){ URL.revokeObjectURL(item._rot.url); item._rot=null; }   // back to upright
+    return baseUrl;
+  }
+  if(item._rot && item._rot.base===baseUrl && item._rot.q===q) return item._rot.url;
+  const url=await rotateUrl(baseUrl, q);
+  if(item._rot) URL.revokeObjectURL(item._rot.url);
+  item._rot={base:baseUrl, q, url};
+  return url;
+}
+
 /* ---------- embedded JPEG preview extraction (no external deps) ----------
    RAW files embed one or more complete JPEGs: a tiny EXIF thumb plus a large
    preview (often near full-res). We locate every JPEG (SOI = FF D8 FF), read
@@ -438,8 +482,11 @@ async function show(i){
   const item = items[cur];
   const url = await ensureUrl(item);
   if(seq!==showSeq) return;         // a newer show() superseded this one
-  if(url && url!=='NONE'){ photo.src=url; photo.hidden=false; }
+  const dUrl = await displayUrl(item, url);   // apply manual orientation override
+  if(seq!==showSeq) return;
+  if(dUrl && dUrl!=='NONE'){ photo.src=dUrl; photo.hidden=false; }
   else { photo.removeAttribute('src'); photo.hidden=true; }
+  $('orient').hidden = !(url && url!=='NONE');
   $('metaName').textContent=item.path;
   $('metaPos').textContent=`· ${cur+1}/${items.length}`+(url==='NONE'?' · no preview':'');
   $('meta').hidden=false;
@@ -741,6 +788,7 @@ async function moveRejected(){
       const w=await dest.createWritable(); await w.write(file); await w.close();
       await item.parent.removeEntry(item.name);
       if(item.url&&item.url!=='NONE') URL.revokeObjectURL(item.url);
+      if(item._rot) URL.revokeObjectURL(item._rot.url);
       done++;
     }catch(e){ console.error(e); }
   }
@@ -755,7 +803,8 @@ async function deleteRejected(){
   let done=0;
   for(const item of rej){
     try{ await item.parent.removeEntry(item.name);
-      if(item.url&&item.url!=='NONE') URL.revokeObjectURL(item.url); done++;
+      if(item.url&&item.url!=='NONE') URL.revokeObjectURL(item.url);
+      if(item._rot) URL.revokeObjectURL(item._rot.url); done++;
     }catch(e){ console.error(e); }
   }
   removeItems(rej);
@@ -769,7 +818,7 @@ function removeItems(toRemove){
   if(!allItems.length){
     items=[]; cur=0;
     photo.hidden=true; $('meta').hidden=true; $('badge').hidden=true; $('flagbar').className='flagbar';
-    film.classList.add('hidden'); $('empty').hidden=false; $('sidebar').classList.add('hidden');
+    film.classList.add('hidden'); $('empty').hidden=false; $('sidebar').classList.add('hidden'); $('orient').hidden=true;
     for(const b of ['btnGrid','btnMove','btnDel']) $(b).disabled=true;
     updateCounts(); return;
   }
@@ -796,13 +845,14 @@ window.addEventListener('keydown',e=>{
     case 'z': if(!viewGrid) toggleZoom(); break;
     case ' ': if(!viewGrid){ e.preventDefault(); toggleZoom(); } break;
     case 'g': toggleGrid(); break;
+    case 'r': if(!viewGrid) rotate(e.shiftKey?-1:1); break;
     case 'escape':                              // Esc fully stops zoom (and the sticky carry-over)
       if(zoom.on||stick.scale>1.001){ stick.scale=1; exitZoom(false); }
       else if(viewGrid) toggleGrid();
       break;
     default: return;
   }
-  if(['arrowleft','arrowright','p','x','u','0','g',' '].includes(e.key.toLowerCase())) e.preventDefault();
+  if(['arrowleft','arrowright','p','x','u','0','g','r',' '].includes(e.key.toLowerCase())) e.preventDefault();
 });
 
 /* ---------- wire up ---------- */
@@ -814,6 +864,28 @@ $('btnDel').onclick=deleteRejected;
 $('btnHelp').onclick=()=>$('help').classList.add('open');
 $('btnCloseHelp').onclick=()=>$('help').classList.remove('open');
 $('help').onclick=e=>{ if(e.target===$('help')) $('help').classList.remove('open'); };
+
+/* ---------- manual orientation tool ---------- */
+function rotate(dir){
+  if(!items.length||viewGrid) return;
+  const item=items[cur];
+  if(rotLock) rotLockVal=(rotLockVal+dir+4)%4;
+  else item.rot=(((item.rot||0)+dir)%4+4)%4;
+  show(cur);
+}
+function toggleRotLock(){
+  rotLock=!rotLock;
+  if(rotLock) rotLockVal=effectiveRot(items[cur]);   // adopt the current photo's rotation
+  $('rotLock').textContent=rotLock?'🔒':'🔓';
+  $('rotLock').classList.toggle('on',rotLock);
+  if(items.length) show(cur);
+}
+const orientEl=$('orient');
+orientEl.addEventListener('pointerdown',e=>e.stopPropagation());   // don't start a pan / toggle zoom
+orientEl.addEventListener('click',e=>e.stopPropagation());
+$('rotL').onclick=()=>rotate(-1);
+$('rotR').onclick=()=>rotate(1);
+$('rotLock').onclick=toggleRotLock;
 </script>
 </body>
 </html>

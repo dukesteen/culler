@@ -1,1 +1,11 @@
 .DS_Store
+# local test photos — never commit RAWs/sample images
+*.RAF
+*.raf
+*.CR2
+*.cr2
+*.CR3
+*.cr3
+*.NEF
+*.ARW
+*.DNG

@@ -332,6 +332,23 @@ function jpegExifTiff(b,start){
   return -1;
 }
 
+/* read IFD0 orientation (tag 0x0112) from a TIFF block at offset t; 0 if absent */
+function tiffOrientation(b,t){
+  const n=b.length;
+  if(t<0||t+8>n) return 0;
+  const le=b[t]===0x49;
+  const u16=o=> le?(b[o]|b[o+1]<<8):(b[o]<<8|b[o+1]);
+  const u32=o=> le?((b[o]|b[o+1]<<8|b[o+2]<<16|b[o+3]<<24)>>>0):(((b[o]<<24|b[o+1]<<16|b[o+2]<<8|b[o+3])>>>0));
+  const ifd0=t+u32(t+4); if(ifd0+2>n) return 0;
+  const count=u16(ifd0);
+  for(let e=0;e<count;e++){ const ent=ifd0+2+e*12; if(ent+12>n) break;
+    if(u16(ent)===0x0112){ const v=u16(ent+8); return v>=1&&v<=8?v:0; } }
+  return 0;
+}
+/* orientation a JPEG carries in its OWN APP1/Exif (0 if none) — when present the
+   browser will rotate the <img> natively, so we must NOT bake it in again. */
+function jpegOrientationTag(b,start){ const t=jpegExifTiff(b,start); return t<0?0:tiffOrientation(b,t); }
+
 /* ---------- EXIF orientation (RAW previews drop the tag; re-apply it) ----------
    Locates the TIFF/EXIF block (JPEG APP1, bare TIFF, Fujifilm RAF's embedded
    JPEG, or any embedded "Exif\0\0") and reads IFD0 tag 0x0112. Returns 1..8,
@@ -354,19 +371,19 @@ function readExifOrientation(b){
     const cap=Math.min(n,2_000_000);
     for(let i=0;i+6<cap;i++) if(b[i]===0x45&&b[i+1]===0x78&&b[i+2]===0x69&&b[i+3]===0x66&&b[i+4]===0&&b[i+5]===0){ t=i+6; break; }
   }
-  if(t<0||t+8>n) return 1;
-  const le=b[t]===0x49;
-  const u16=o=> le ? (b[o]|(b[o+1]<<8)) : ((b[o]<<8)|b[o+1]);
-  const u32=o=> le ? ((b[o]|(b[o+1]<<8)|(b[o+2]<<16)|(b[o+3]<<24))>>>0) : (((b[o]<<24)|(b[o+1]<<16)|(b[o+2]<<8)|b[o+3])>>>0);
-  const ifd0=t+u32(t+4);
-  if(ifd0+2>n) return 1;
-  const count=u16(ifd0);
-  for(let e=0;e<count;e++){
-    const ent=ifd0+2+e*12;
-    if(ent+12>n) break;
-    if(u16(ent)===0x0112){ const v=u16(ent+8); return v>=1&&v<=8?v:1; }
-  }
-  return 1;
+  return tiffOrientation(b,t)||1;
+}
+
+/* Decide how to present an extracted preview:
+   - if the JPEG already carries its own EXIF orientation → hand it straight to
+     the browser, which rotates it natively (baking would double-rotate);
+   - else, if orientation is only known from the container (e.g. CR2's TIFF
+     tags) → bake it into the pixels.
+   `head` is the first chunk of the preview JPEG (enough to hold its APP1). */
+async function previewToUrl(head, blob, containerOri){
+  if(jpegOrientationTag(head,0)) return URL.createObjectURL(blob);
+  if(containerOri>1) return await orientToUrl(blob, containerOri);
+  return URL.createObjectURL(blob);
 }
 
 /* bake a non-trivial orientation into the pixels so natural dimensions are
@@ -395,7 +412,7 @@ async function orientToUrl(blob, o){
 function effectiveRot(item){ return ((rotLock?rotLockVal:(item&&item.rot||0))%4+4)%4; }
 async function rotateUrl(srcUrl, q){
   const blob=await (await fetch(srcUrl)).blob();
-  const bmp=await createImageBitmap(blob);
+  const bmp=await createImageBitmap(blob,{imageOrientation:'from-image'});  // start from the upright image
   const w=bmp.width, h=bmp.height, swap=q%2===1;
   const cv=document.createElement('canvas');
   cv.width=swap?h:w; cv.height=swap?w:h;
@@ -496,9 +513,10 @@ async function extractCR2(file){
   }
   if(comp!==6||!soff||!slen||soff+slen>file.size) return null;
   const blob=file.slice(soff,soff+slen,'image/jpeg');
-  const sig=new Uint8Array(await blob.slice(0,2).arrayBuffer());
-  if(sig[0]!==0xFF||sig[1]!==0xD8) return null;          // must be a real JPEG, not the lossless RAW
-  return {blob,orientation};
+  const headLen=Math.min(slen,65536);
+  const head=new Uint8Array(await file.slice(soff,soff+headLen).arrayBuffer());
+  if(head[0]!==0xFF||head[1]!==0xD8) return null;        // must be a real JPEG, not the lossless RAW
+  return {blob,orientation,head};
 }
 /* CR3 is ISO-BMFF (MP4-like boxes): orientation lives in moov→…→CMT1 (a TIFF
    block); the full preview JPEG lives in a top-level uuid box's PRVW atom. */
@@ -534,7 +552,8 @@ async function extractCR3(file){
     let j=pi; while(j+2<ub.length && !(ub[j]===0xFF&&ub[j+1]===0xD8&&ub[j+2]===0xFF)) j++;
     if(j+2>=ub.length) continue;
     let k=j+2; while(k+1<ub.length && !(ub[k]===0xFF&&ub[k+1]===0xD9)) k++;
-    return {blob:new Blob([ub.subarray(j,Math.min(ub.length,k+2))],{type:'image/jpeg'}), orientation};
+    const end=Math.min(ub.length,k+2);
+    return {blob:new Blob([ub.subarray(j,end)],{type:'image/jpeg'}), orientation, head:ub.subarray(j,Math.min(end,j+65536))};
   }
   return null;
 }
@@ -552,8 +571,7 @@ async function ensureUrl(item){
     try{
       const file=await item.handle.getFile();
       if(item.kind==='image'){
-        const head=new Uint8Array(await file.slice(0,262144).arrayBuffer());
-        item.url=await orientToUrl(file, readExifOrientation(head));
+        item.url=URL.createObjectURL(file);                    // browser honours the file's own EXIF orientation
       }else{
         const ext=item.name.split('.').pop().toLowerCase();
         let fast=null;
@@ -562,13 +580,15 @@ async function ensureUrl(item){
           else if(ext==='cr3') fast=await extractCR3(file);
         }catch(e){ fast=null; }                                // any trouble → generic path
         if(fast){
-          item.url=await orientToUrl(fast.blob, fast.orientation);
+          item.url=await previewToUrl(fast.head, fast.blob, fast.orientation);
         }else{
           const buf=new Uint8Array(await file.arrayBuffer());  // generic: scan the whole file
           const jpg=findLargestJpeg(buf);
-          item.url = jpg
-            ? await orientToUrl(new Blob([buf.subarray(jpg.start,jpg.end)],{type:'image/jpeg'}), readExifOrientation(buf))
-            : 'NONE';                                          // big buffer is freed after this scope
+          if(!jpg) item.url='NONE';                            // big buffer is freed after this scope
+          else{
+            const head=buf.subarray(jpg.start, Math.min(buf.length, jpg.start+65536));
+            item.url=await previewToUrl(head, new Blob([buf.subarray(jpg.start,jpg.end)],{type:'image/jpeg'}), readExifOrientation(buf));
+          }
         }
       }
     }catch(e){ item.url='NONE'; }

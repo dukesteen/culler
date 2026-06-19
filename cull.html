@@ -1,0 +1,819 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cull — RAW photo sorter</title>
+<style>
+  :root{
+    --bg:#0e0e10; --panel:#16161a; --panel-2:#1e1e23; --line:#2a2a30;
+    --text:#e8e8ec; --muted:#85858f; --faint:#56565e;
+    --pick:#5fd08a; --reject:#ef5f6b; --sel:#6aa3ff;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:var(--bg);color:var(--text);font-family:var(--sans);
+    display:flex;flex-direction:column;overflow:hidden;user-select:none;
+  }
+  button{font-family:inherit;cursor:pointer}
+  ::-webkit-scrollbar{height:0;width:0}
+  /* class selectors that set `display` (.empty, .stage img, .grid) outrank the
+     UA [hidden] rule, so el.hidden silently did nothing — force it back. */
+  [hidden]{display:none!important}
+
+  /* top bar */
+  header{
+    display:flex;align-items:center;gap:14px;padding:10px 14px;
+    background:var(--panel);border-bottom:1px solid var(--line);flex:0 0 auto;
+  }
+  .brand{font-family:var(--mono);font-weight:600;letter-spacing:.12em;font-size:13px;text-transform:uppercase}
+  .brand b{color:var(--pick)}
+  .folder{font-family:var(--mono);font-size:12px;color:var(--muted);
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:240px}
+  .spacer{flex:1}
+  .counts{display:flex;gap:14px;font-family:var(--mono);font-size:12px;color:var(--muted)}
+  .counts span b{color:var(--text);font-weight:600}
+  .counts .p b{color:var(--pick)} .counts .r b{color:var(--reject)}
+  .btn{
+    background:var(--panel-2);color:var(--text);border:1px solid var(--line);
+    border-radius:7px;padding:7px 11px;font-size:12.5px;line-height:1;transition:.12s;
+  }
+  .btn:hover{border-color:#3a3a42;background:#26262c}
+  .btn:disabled{opacity:.4;cursor:default}
+  .btn.primary{background:var(--text);color:#111;border-color:var(--text);font-weight:600}
+  .btn.danger:hover{border-color:var(--reject);color:var(--reject)}
+
+  /* work area: folder sidebar + stage */
+  .work{flex:1;display:flex;min-height:0}
+  .sidebar{flex:0 0 200px;background:var(--panel);border-right:1px solid var(--line);
+    overflow-y:auto;padding:8px;min-height:0}
+  .sidebar.hidden{display:none}
+  .sidebar .fld{display:flex;align-items:center;gap:8px;width:100%;text-align:left;
+    background:transparent;border:0;color:var(--muted);padding:7px 9px;border-radius:6px;
+    font-family:var(--mono);font-size:12px;line-height:1.3;white-space:nowrap;overflow:hidden}
+  .sidebar .fld:hover{background:var(--panel-2)}
+  .sidebar .fld.cur{background:var(--panel-2);color:var(--text)}
+  .sidebar .fld .nm{flex:1;overflow:hidden;text-overflow:ellipsis}
+  .sidebar .fld .ct{color:var(--faint);font-size:11px}
+
+  /* stage */
+  main{flex:1;position:relative;overflow:hidden;min-height:0}
+  .stage{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    overflow:hidden;background:var(--bg)}
+  .stage.zoom{cursor:grab}
+  .stage.zoom.grabbing{cursor:grabbing}
+  .stage img{display:block;max-width:100%;max-height:100%;object-fit:contain;
+    transform-origin:center center;will-change:transform;
+    -webkit-user-drag:none;user-select:none;-webkit-user-select:none}
+  /* navigator / minimap */
+  .minimap{position:absolute;top:14px;left:14px;z-index:6;width:180px;border-radius:6px;
+    overflow:hidden;border:1px solid rgba(255,255,255,.25);box-shadow:0 4px 16px rgba(0,0,0,.5);
+    cursor:crosshair;background:#000;line-height:0}
+  .minimap img{display:block;width:100%;height:auto;opacity:.85}
+  .mmview{position:absolute;border:1.5px solid #fff;box-shadow:0 0 0 1px rgba(0,0,0,.55);
+    background:rgba(120,160,255,.14);pointer-events:none}
+  .flagbar{position:absolute;top:0;left:0;right:0;height:3px;background:transparent;z-index:5}
+  .flagbar.pick{background:var(--pick)} .flagbar.reject{background:var(--reject)}
+  .meta{position:absolute;left:14px;bottom:14px;z-index:5;font-family:var(--mono);font-size:12px;
+    color:var(--muted);background:rgba(14,14,16,.6);padding:6px 9px;border-radius:6px;
+    backdrop-filter:blur(6px);pointer-events:none}
+  .meta .name{color:var(--text)}
+  .badge{position:absolute;top:14px;right:14px;z-index:5;font-family:var(--mono);font-size:11px;
+    letter-spacing:.1em;text-transform:uppercase;padding:5px 9px;border-radius:6px;font-weight:600}
+  .badge.pick{background:var(--pick);color:#06301a} .badge.reject{background:var(--reject);color:#3a0a0e}
+
+  /* empty / loading state */
+  .empty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;gap:18px;text-align:center;padding:24px}
+  .empty h1{font-size:22px;font-weight:600;letter-spacing:-.01em}
+  .empty p{color:var(--muted);max-width:420px;font-size:14px;line-height:1.5}
+  .empty .keys{font-family:var(--mono);font-size:12px;color:var(--faint)}
+
+  /* grid / contact sheet */
+  .grid{position:absolute;inset:0;overflow-y:auto;padding:14px;
+    display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;align-content:start}
+  .cell{position:relative;aspect-ratio:3/2;background:var(--panel);border-radius:6px;overflow:hidden;
+    border:2px solid transparent}
+  .cell.cur{border-color:var(--sel)}
+  .cell img{width:100%;height:100%;object-fit:cover;display:block}
+  .cell .ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;
+    color:var(--faint);font-family:var(--mono);font-size:11px}
+  .cell.pick{box-shadow:inset 0 0 0 2px var(--pick)}
+  .cell.reject{box-shadow:inset 0 0 0 2px var(--reject)}
+  .cell.reject img{opacity:.4}
+  .cell .tag{position:absolute;top:5px;right:5px;font-family:var(--mono);font-size:10px;font-weight:700;
+    padding:2px 5px;border-radius:4px}
+  .cell .tag.pick{background:var(--pick);color:#06301a} .cell .tag.reject{background:var(--reject);color:#3a0a0e}
+  .cell .fn{position:absolute;left:0;right:0;bottom:0;font-family:var(--mono);font-size:10px;
+    color:var(--muted);background:linear-gradient(transparent,rgba(0,0,0,.8));padding:10px 6px 4px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+  /* filmstrip */
+  footer{flex:0 0 auto;background:var(--panel);border-top:1px solid var(--line);padding:8px;
+    display:flex;gap:6px;overflow-x:auto;align-items:center}
+  footer.hidden{display:none}
+  .thumb{position:relative;flex:0 0 auto;width:84px;height:56px;border-radius:5px;overflow:hidden;
+    background:var(--panel-2);border:2px solid transparent;cursor:pointer}
+  .thumb.cur{border-color:var(--sel)}
+  .thumb img{width:100%;height:100%;object-fit:cover;display:block}
+  .thumb .ph{width:100%;height:100%;display:flex;align-items:center;justify-content:center;
+    color:var(--faint);font-family:var(--mono);font-size:9px}
+  .thumb.pick::after,.thumb.reject::after{content:"";position:absolute;left:0;right:0;bottom:0;height:3px}
+  .thumb.pick::after{background:var(--pick)} .thumb.reject::after{background:var(--reject)}
+  .thumb.reject img{opacity:.45}
+
+  /* help overlay */
+  .help{position:fixed;inset:0;background:rgba(8,8,10,.86);backdrop-filter:blur(4px);z-index:50;
+    display:none;align-items:center;justify-content:center}
+  .help.open{display:flex}
+  .help .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px 28px;
+    width:min(420px,90vw)}
+  .help h2{font-size:16px;margin-bottom:16px;letter-spacing:.02em}
+  .help dl{display:grid;grid-template-columns:auto 1fr;gap:9px 16px;font-size:13px;align-items:baseline}
+  .help kbd{font-family:var(--mono);font-size:12px;background:var(--panel-2);border:1px solid var(--line);
+    border-bottom-width:2px;border-radius:5px;padding:2px 7px;color:var(--text);justify-self:start}
+  .help dd{color:var(--muted)}
+  .help .close{margin-top:20px;width:100%;text-align:center}
+
+  .toast{position:fixed;bottom:80px;left:50%;transform:translateX(-50%);z-index:60;
+    background:var(--panel-2);border:1px solid var(--line);border-radius:8px;padding:10px 16px;
+    font-size:13px;opacity:0;transition:.2s;pointer-events:none}
+  .toast.show{opacity:1}
+</style>
+</head>
+<body>
+<header>
+  <span class="brand"><b>●</b> Cull</span>
+  <span class="folder" id="folderName">no folder open</span>
+  <span class="spacer"></span>
+  <span class="counts">
+    <span>tot <b id="cTot">0</b></span>
+    <span class="p">pick <b id="cPick">0</b></span>
+    <span class="r">rej <b id="cRej">0</b></span>
+  </span>
+  <button class="btn" id="btnGrid" disabled>Grid</button>
+  <button class="btn danger" id="btnMove" disabled>Move rejected</button>
+  <button class="btn danger" id="btnDel" disabled>Delete rejected</button>
+  <button class="btn" id="btnHelp">?</button>
+  <button class="btn primary" id="btnOpen">Open folder</button>
+</header>
+
+<div class="work">
+<aside class="sidebar hidden" id="sidebar"></aside>
+<main>
+  <div class="stage" id="stage">
+    <div class="empty" id="empty">
+      <h1>Open a folder of photos to start culling</h1>
+      <p>Pulls the full-size JPEG preview embedded in RAW files (CR2, CR3, NEF, ARW, RAF, DNG, ORF, RW2…),
+         plus regular JPEG/PNG/WebP/TIFF at full resolution. Runs entirely offline — files never leave your disk.</p>
+      <p class="keys">P pick · X reject · U unflag · ← → move · Z zoom · G grid · ? shortcuts</p>
+      <button class="btn primary" id="btnOpen2">Open folder</button>
+    </div>
+    <div class="flagbar" id="flagbar"></div>
+    <img id="photo" alt="" hidden draggable="false">
+    <div class="badge" id="badge" hidden></div>
+    <div class="meta" id="meta" hidden><span class="name" id="metaName"></span> <span id="metaPos"></span></div>
+    <div class="minimap" id="minimap" hidden><img id="mmImg" alt="" draggable="false"><div class="mmview" id="mmView"></div></div>
+  </div>
+  <div class="grid" id="grid" hidden></div>
+</main>
+</div>
+
+<footer id="filmstrip" class="hidden"></footer>
+
+<div class="help" id="help">
+  <div class="card">
+    <h2>Keyboard</h2>
+    <dl>
+      <kbd>P</kbd><dd>Flag as pick</dd>
+      <kbd>X</kbd><dd>Flag as reject</dd>
+      <kbd>U</kbd> / <kbd>0</kbd><dd>Remove flag</dd>
+      <kbd>←</kbd> / <kbd>→</kbd><dd>Previous / next photo</dd>
+      <kbd>Z</kbd> / <kbd>Space</kbd><dd>Toggle 1:1 zoom · click a spot to zoom there, drag to pan, sideways-scroll to scale, navigator box to jump</dd>
+      <kbd>scroll</kbd><dd>Vertical scrolls the gallery · horizontal zooms the photo</dd>
+      <kbd>lock</kbd><dd>Zoom level + spot carry to the next photo (Esc to release)</dd>
+      <kbd>G</kbd><dd>Toggle grid / single view</dd>
+      <kbd>Esc</kbd><dd>Stop zoom (clears the locked level) or exit grid</dd>
+    </dl>
+    <button class="btn close" id="btnCloseHelp">Close</button>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const RAW_EXT = ['cr2','cr3','crw','nef','nrw','arw','srf','sr2','raf','rw2','orf','dng','pef','raw','3fr','erf','kdc','mrw','x3f'];
+const IMG_EXT = ['jpg','jpeg','png','webp','gif','bmp','avif','tif','tiff'];
+
+const $ = id => document.getElementById(id);
+const stage=$('stage'), photo=$('photo'), grid=$('grid'), film=$('filmstrip');
+
+let dirHandle=null;
+let allItems=[];       // every photo found, across all folders
+let folders=[];        // [{path, count}] — one entry per folder containing photos
+let curFolder='';      // relative path of the folder currently shown
+let items=[];          // {name, path, dir, handle, parent, kind, flag:-1|0|1, url, el(thumb), gcell} for curFolder
+let cur=0;
+let viewGrid=false;
+let zoom={on:false,scale:1,tx:0,ty:0,max:1,one:1,_b:null,
+          dragging:false,moved:false,startX:0,startY:0,startTx:0,startTy:0};
+let stick={scale:1,fx:.5,fy:.5};   // sticky zoom carried across images (1 = off)
+let showSeq=0;                     // guards against stale async show() finishing late
+
+/* ---------- folder open & enumeration ---------- */
+async function openFolder(){
+  if(!window.showDirectoryPicker){
+    alert('This browser lacks the File System Access API. Use Chrome, Edge, Arc, or Brave.');
+    return;
+  }
+  try{ dirHandle = await window.showDirectoryPicker({mode:'readwrite'}); }
+  catch(e){ return; }
+
+  allItems=[]; items=[]; cur=0;
+  $('folderName').textContent = dirHandle.name;
+  try{ await collect(dirHandle, ''); }
+  catch(e){ console.error(e); toast('Could not read this folder'); }
+  allItems.sort((a,b)=>a.path.localeCompare(b.path,undefined,{numeric:true}));
+
+  $('empty').hidden = allItems.length>0;
+  for(const b of ['btnGrid','btnMove','btnDel']) $(b).disabled = allItems.length===0;
+  buildFolderList();
+  if(allItems.length) selectFolder(folders[0].path);
+  else { film.classList.add('hidden'); updateCounts(); }
+}
+
+/* ---------- folder sidebar ---------- */
+function buildFolderList(){
+  const counts=new Map();
+  for(const it of allItems) counts.set(it.dir,(counts.get(it.dir)||0)+1);
+  folders=[...counts.keys()]
+    .sort((a,b)=>a.localeCompare(b,undefined,{numeric:true}))
+    .map(p=>({path:p,count:counts.get(p)}));
+  const sb=$('sidebar'); sb.innerHTML='';
+  folders.forEach(f=>{
+    const depth=f.path?f.path.split('/').filter(Boolean).length:0;
+    const name=f.path ? f.path.replace(/\/$/,'').split('/').pop() : dirHandle.name;
+    const b=document.createElement('button');
+    b.className='fld'; b.dataset.path=f.path;
+    b.style.paddingLeft=(9+depth*12)+'px';
+    const nm=document.createElement('span'); nm.className='nm'; nm.textContent=name;
+    const ct=document.createElement('span'); ct.className='ct'; ct.textContent=f.count;
+    b.append(nm,ct);
+    b.onclick=()=>selectFolder(f.path);
+    sb.appendChild(b);
+  });
+  // a lone folder needs no picker — keep the chrome out of the way
+  sb.classList.toggle('hidden', folders.length<=1);
+}
+function selectFolder(path, idx=0){
+  curFolder=path;
+  items=allItems.filter(it=>it.dir===path);
+  cur=Math.min(Math.max(0,idx), Math.max(0,items.length-1));
+  [...$('sidebar').children].forEach(b=>b.classList.toggle('cur',b.dataset.path===path));
+  $('empty').hidden = allItems.length>0;
+  film.classList.toggle('hidden', items.length===0);
+  buildFilmstrip();
+  if(viewGrid) buildGrid();
+  else if(items.length) show(cur);
+  updateCounts();
+}
+
+/* recurse into subfolders; a bad entry skips itself instead of killing the
+   whole scan. `_rejected` and dotfolders are left out of the cull set. */
+async function collect(handle, prefix){
+  for await (const entry of handle.values()){
+    try{
+      if(entry.kind==='directory'){
+        if(entry.name==='_rejected'||entry.name.startsWith('.')) continue;
+        await collect(entry, prefix+entry.name+'/');
+        continue;
+      }
+      const ext = entry.name.split('.').pop().toLowerCase();
+      let kind=null;
+      if(RAW_EXT.includes(ext)) kind='raw';
+      else if(IMG_EXT.includes(ext)) kind='image';
+      if(!kind) continue;
+      allItems.push({name:entry.name, path:prefix+entry.name, dir:prefix, handle:entry, parent:handle,
+                  kind, flag:0, url:null, el:null, gcell:null});
+    }catch(e){ console.warn('skipped', entry&&entry.name, e); }
+  }
+}
+
+/* ---------- EXIF orientation (RAW previews drop the tag; re-apply it) ----------
+   Locates the TIFF/EXIF block (JPEG APP1, bare TIFF, or any embedded "Exif\0\0")
+   and reads IFD0 tag 0x0112. Returns 1..8, or 1 when absent/unparseable. */
+function readExifOrientation(b){
+  const n=b.length; let t=-1;
+  if(b[0]===0xFF&&b[1]===0xD8){                                   // JPEG: walk to APP1/Exif
+    let i=2;
+    while(i+4<n){
+      if(b[i]!==0xFF){ i++; continue; }
+      const m=b[i+1];
+      if(m===0xD9||m===0xDA) break;
+      const size=(b[i+2]<<8)|b[i+3];
+      if(m===0xE1&&b[i+4]===0x45&&b[i+5]===0x78&&b[i+6]===0x69&&b[i+7]===0x66&&b[i+8]===0&&b[i+9]===0){ t=i+10; break; }
+      if(size<2) break;
+      i+=2+size;
+    }
+  }else if((b[0]===0x49&&b[1]===0x49&&b[2]===0x2A&&b[3]===0)||(b[0]===0x4D&&b[1]===0x4D&&b[2]===0&&b[3]===0x2A)){
+    t=0;                                                          // bare TIFF (most RAW)
+  }
+  if(t<0){                                                        // fallback: first Exif marker
+    const cap=Math.min(n,2_000_000);
+    for(let i=0;i+6<cap;i++) if(b[i]===0x45&&b[i+1]===0x78&&b[i+2]===0x69&&b[i+3]===0x66&&b[i+4]===0&&b[i+5]===0){ t=i+6; break; }
+  }
+  if(t<0||t+8>n) return 1;
+  const le=b[t]===0x49;
+  const u16=o=> le ? (b[o]|(b[o+1]<<8)) : ((b[o]<<8)|b[o+1]);
+  const u32=o=> le ? ((b[o]|(b[o+1]<<8)|(b[o+2]<<16)|(b[o+3]<<24))>>>0) : (((b[o]<<24)|(b[o+1]<<16)|(b[o+2]<<8)|b[o+3])>>>0);
+  const ifd0=t+u32(t+4);
+  if(ifd0+2>n) return 1;
+  const count=u16(ifd0);
+  for(let e=0;e<count;e++){
+    const ent=ifd0+2+e*12;
+    if(ent+12>n) break;
+    if(u16(ent)===0x0112){ const v=u16(ent+8); return v>=1&&v<=8?v:1; }
+  }
+  return 1;
+}
+
+/* bake a non-trivial orientation into the pixels so natural dimensions are
+   correct everywhere (fit, thumbnails, zoom) with no display-side transforms. */
+async function orientToUrl(blob, o){
+  if(!o||o===1) return URL.createObjectURL(blob);
+  try{
+    const bmp=await createImageBitmap(blob,{imageOrientation:'none'});
+    const w=bmp.width, h=bmp.height, swap=o>=5;
+    const cv=document.createElement('canvas');
+    cv.width=swap?h:w; cv.height=swap?w:h;
+    const x=cv.getContext('2d');
+    const M={2:[-1,0,0,1,w,0],3:[-1,0,0,-1,w,h],4:[1,0,0,-1,0,h],
+             5:[0,1,1,0,0,0],6:[0,1,-1,0,h,0],7:[0,-1,-1,0,h,w],8:[0,-1,1,0,0,w]}[o];
+    if(M) x.setTransform(M[0],M[1],M[2],M[3],M[4],M[5]);
+    x.drawImage(bmp,0,0);
+    if(bmp.close) bmp.close();
+    const out=await new Promise(r=>cv.toBlob(r,'image/jpeg',0.92));
+    return URL.createObjectURL(out||blob);
+  }catch(e){ return URL.createObjectURL(blob); }
+}
+
+/* ---------- embedded JPEG preview extraction (no external deps) ----------
+   RAW files embed one or more complete JPEGs: a tiny EXIF thumb plus a large
+   preview (often near full-res). We locate every JPEG (SOI = FF D8 FF), read
+   its true dimensions from the SOFn frame header, and keep the largest one.
+   JPEG byte-stuffing guarantees FF D9 only appears as the real end-of-image
+   after the scan header, so the slice bounds are exact — no truncation. */
+function findLargestJpeg(buf){
+  const n=buf.length; let best=null;
+  for(let i=0;i+3<n;i++){
+    if(buf[i]!==0xFF||buf[i+1]!==0xD8||buf[i+2]!==0xFF) continue;
+    const p=parseJpeg(buf,i);
+    if(p){ if(!best||p.area>best.area) best=p; i=p.end-1; }
+  }
+  return best;
+}
+function parseJpeg(buf,start){
+  const n=buf.length; let i=start+2, w=0, h=0;
+  try{
+    while(i+1<n){
+      if(buf[i]!==0xFF) return null;
+      const m=buf[i+1];
+      if(m===0x01||(m>=0xD0&&m<=0xD7)){ i+=2; continue; }      // standalone marker, no length
+      if(m===0xD9) return null;                                // EOI before SOS = malformed
+      const len=(buf[i+2]<<8)|buf[i+3];
+      if(len<2) return null;
+      if(m>=0xC0&&m<=0xCF&&m!==0xC4&&m!==0xC8&&m!==0xCC){       // SOFn frame header
+        h=(buf[i+5]<<8)|buf[i+6]; w=(buf[i+7]<<8)|buf[i+8];
+      }
+      if(m===0xDA){                                            // SOS — entropy data follows
+        let j=i+2+len;
+        while(j+1<n && !(buf[j]===0xFF&&buf[j+1]===0xD9)) j++;  // scan to true EOI
+        if(!w||!h) return null;
+        return {start, end:Math.min(n,j+2), w, h, area:w*h};
+      }
+      i+=2+len;
+    }
+  }catch(e){}
+  return null;
+}
+
+/* limit concurrent reads so a large grid doesn't pull every RAW into memory at once */
+let active=0; const waitQ=[];
+const gate =()=>active<3?(active++,Promise.resolve()):new Promise(r=>waitQ.push(()=>{active++;r();}));
+const ungate=()=>{ active--; const next=waitQ.shift(); if(next) next(); };
+
+async function ensureUrl(item){
+  if(item.url) return item.url;
+  if(item._loading) return item._loading;
+  item._loading=(async()=>{
+    await gate();
+    try{
+      const file=await item.handle.getFile();
+      if(item.kind==='image'){
+        const head=new Uint8Array(await file.slice(0,262144).arrayBuffer());
+        item.url=await orientToUrl(file, readExifOrientation(head));
+      }else{
+        const buf=new Uint8Array(await file.arrayBuffer());
+        const jpg=findLargestJpeg(buf);
+        item.url = jpg
+          ? await orientToUrl(new Blob([buf.subarray(jpg.start,jpg.end)],{type:'image/jpeg'}), readExifOrientation(buf))
+          : 'NONE';                                            // big buffer is freed after this scope
+      }
+    }catch(e){ item.url='NONE'; }
+    finally{ ungate(); }
+    return item.url;
+  })();
+  return item._loading;
+}
+
+/* ---------- single (loupe) view ---------- */
+async function show(i){
+  if(!items.length) return;
+  const seq=++showSeq;
+  const wasZoomed=zoom.on;          // only carry zoom if the previous photo was actually zoomed
+  cur = (i+items.length)%items.length;
+  exitZoom();                       // remembers the outgoing image's zoom level into `stick`
+  const item = items[cur];
+  const url = await ensureUrl(item);
+  if(seq!==showSeq) return;         // a newer show() superseded this one
+  if(url && url!=='NONE'){ photo.src=url; photo.hidden=false; }
+  else { photo.removeAttribute('src'); photo.hidden=true; }
+  $('metaName').textContent=item.path;
+  $('metaPos').textContent=`· ${cur+1}/${items.length}`+(url==='NONE'?' · no preview':'');
+  $('meta').hidden=false;
+  updateFlagUI();
+  highlightFilmstrip();
+  // preload neighbours
+  ensureUrl(items[(cur+1)%items.length]);
+  ensureUrl(items[(cur-1+items.length)%items.length]);
+  // carry zoom to the new photo only if we were zoomed in on the last one
+  if(wasZoomed && stick.scale>1.001 && url && url!=='NONE'){
+    try{ await photo.decode(); }catch(_){}
+    if(seq===showSeq) applyStick();
+  }
+}
+
+function updateFlagUI(){
+  const f=items[cur]?.flag||0;
+  $('flagbar').className='flagbar'+(f>0?' pick':f<0?' reject':'');
+  const badge=$('badge');
+  if(f>0){badge.hidden=false;badge.className='badge pick';badge.textContent='Pick';}
+  else if(f<0){badge.hidden=false;badge.className='badge reject';badge.textContent='Reject';}
+  else badge.hidden=true;
+}
+
+/* ---------- flagging ---------- */
+function setFlag(f){
+  if(!items.length) return;
+  const item = viewGrid ? items[cur] : items[cur];
+  item.flag = item.flag===f ? 0 : f;
+  updateFlagUI();
+  refreshThumbState(item);
+  if(item.gcell) refreshCellState(item);
+  updateCounts();
+  // auto-advance after flagging in loupe view (Lightroom-style)
+  if(!viewGrid) show(cur+1);
+}
+
+function updateCounts(){
+  $('cTot').textContent=items.length;
+  $('cPick').textContent=items.filter(x=>x.flag>0).length;
+  $('cRej').textContent=items.filter(x=>x.flag<0).length;
+  const n=items.filter(x=>x.flag<0).length;
+  $('btnMove').textContent=`Move rejected${n?` (${n})`:''}`;
+  $('btnDel').textContent=`Delete rejected${n?` (${n})`:''}`;
+}
+
+/* ---------- filmstrip ---------- */
+const io = new IntersectionObserver(es=>{
+  for(const e of es){ if(e.isIntersecting){ loadThumb(e.target.__item, e.target); io.unobserve(e.target);} }
+},{root:null,rootMargin:'200px'});
+
+function buildFilmstrip(){
+  film.innerHTML='';
+  items.forEach((item,idx)=>{
+    const t=document.createElement('div');
+    t.className='thumb'; t.__item=item; item.el=t;
+    const ph=document.createElement('div'); ph.className='ph'; ph.textContent=item.kind.toUpperCase();
+    t.appendChild(ph);
+    t.onclick=()=>{ if(viewGrid) toggleGrid(); show(idx); };
+    film.appendChild(t);
+    io.observe(t);
+  });
+  refreshAllThumbStates();
+}
+async function loadThumb(item,el){
+  const url=await ensureUrl(item);
+  if(url && url!=='NONE'){ const im=new Image(); im.src=url; el.innerHTML=''; el.appendChild(im); }
+}
+function refreshThumbState(item){
+  if(!item.el) return;
+  item.el.classList.toggle('pick',item.flag>0);
+  item.el.classList.toggle('reject',item.flag<0);
+}
+function refreshAllThumbStates(){ items.forEach(refreshThumbState); }
+function highlightFilmstrip(){
+  items.forEach(it=>it.el&&it.el.classList.remove('cur'));
+  const el=items[cur]?.el;
+  if(el){ el.classList.add('cur'); el.scrollIntoView({inline:'center',block:'nearest',behavior:'smooth'}); }
+}
+
+/* ---------- grid / contact sheet ---------- */
+const gio = new IntersectionObserver(es=>{
+  for(const e of es){ if(e.isIntersecting){ loadCell(e.target.__item,e.target); gio.unobserve(e.target);} }
+},{root:grid,rootMargin:'300px'});
+
+function toggleGrid(){
+  viewGrid=!viewGrid;
+  grid.hidden=!viewGrid;
+  stage.style.display=viewGrid?'none':'flex';
+  $('btnGrid').textContent=viewGrid?'Single':'Grid';
+  if(viewGrid) buildGrid(); else show(cur);
+}
+function buildGrid(){
+  grid.innerHTML='';
+  items.forEach((item,idx)=>{
+    const c=document.createElement('div'); c.className='cell'; c.__item=item; item.gcell=c;
+    const ph=document.createElement('div'); ph.className='ph'; ph.textContent=item.kind.toUpperCase();
+    c.appendChild(ph);
+    const fn=document.createElement('div'); fn.className='fn'; fn.textContent=item.path; c.appendChild(fn);
+    c.onclick=()=>{ cur=idx; toggleGrid(); };
+    c.oncontextmenu=(e)=>{ e.preventDefault(); cur=idx; setFlag(item.flag<0?0:-1); };
+    grid.appendChild(c);
+    gio.observe(c);
+    refreshCellState(item);
+  });
+}
+async function loadCell(item,c){
+  const url=await ensureUrl(item);
+  if(url&&url!=='NONE'){ const im=new Image(); im.src=url; c.insertBefore(im,c.firstChild); }
+  refreshCellState(item);
+}
+function refreshCellState(item){
+  const c=item.gcell; if(!c) return;
+  c.classList.toggle('pick',item.flag>0);
+  c.classList.toggle('reject',item.flag<0);
+  c.classList.toggle('cur',items[cur]===item);
+  let tag=c.querySelector('.tag');
+  if(item.flag!==0){
+    if(!tag){tag=document.createElement('div');tag.className='tag';c.appendChild(tag);}
+    tag.className='tag '+(item.flag>0?'pick':'reject');
+    tag.textContent=item.flag>0?'P':'X';
+  }else if(tag){tag.remove();}
+}
+
+/* ---------- zoom & pan (transform-based, full-range) ----------
+   The image stays laid out at fit size; zoom/pan are a CSS translate+scale, so
+   every part is reachable (the old scroll-on-a-flex-centered-stage trick left
+   the leading edges unreachable). tx/ty are the image-centre offset from the
+   stage centre, in screen px; clampPan keeps the frame filled with no gaps. */
+function zoomBase(){
+  return {bw:photo.clientWidth, bh:photo.clientHeight,
+          sw:stage.clientWidth, sh:stage.clientHeight,
+          nw:photo.naturalWidth, nh:photo.naturalHeight};
+}
+function clampPan(){
+  const b=zoom._b; if(!b) return;
+  const maxX=Math.max(0,(b.bw*zoom.scale-b.sw)/2), maxY=Math.max(0,(b.bh*zoom.scale-b.sh)/2);
+  zoom.tx=Math.min(maxX,Math.max(-maxX,zoom.tx));
+  zoom.ty=Math.min(maxY,Math.max(-maxY,zoom.ty));
+}
+function applyZoom(){
+  clampPan();
+  photo.style.transform=`translate(${zoom.tx}px,${zoom.ty}px) scale(${zoom.scale})`;
+  drawMinimap();
+}
+function beginZoom(){                          // set up scales + navigator, scale untouched
+  const b=zoomBase(); zoom._b=b;
+  zoom.one=Math.max(b.nw/b.bw, 1);            // 100% (1:1)
+  zoom.max=zoom.one*2.2;                      // allow pushing past 1:1 to inspect closer
+  zoom.on=true; stage.classList.add('zoom');
+  $('mmImg').src=photo.src;
+  $('minimap').hidden=false;
+}
+function enterZoom(cx,cy){                     // click / drag → snap to the remembered level (else 100%)
+  if(photo.hidden||!photo.naturalWidth) return;
+  beginZoom();
+  const b=zoom._b, r=stage.getBoundingClientRect();
+  const ox=(cx==null?b.sw/2:cx-r.left)-b.sw/2, oy=(cy==null?b.sh/2:cy-r.top)-b.sh/2;
+  zoom.scale=stick.scale>1.001 ? Math.min(stick.scale,zoom.max) : zoom.one;
+  zoom.tx=ox*(1-zoom.scale);                  // keep the point under the cursor fixed
+  zoom.ty=oy*(1-zoom.scale);
+  applyZoom();
+}
+function applyStick(){                         // re-apply the sticky level + framing to the current image
+  if(photo.hidden||!photo.naturalWidth) return;
+  beginZoom();
+  zoom.scale=Math.min(stick.scale,zoom.max);
+  const b=zoom._b;
+  zoom.tx=(0.5-stick.fx)*b.bw*zoom.scale;
+  zoom.ty=(0.5-stick.fy)*b.bh*zoom.scale;
+  applyZoom();
+}
+function rememberZoom(){                        // capture current level + viewport centre into `stick`
+  if(!zoom.on||!zoom._b) return;
+  const b=zoom._b;
+  stick.scale=zoom.scale;
+  stick.fx=0.5-zoom.tx/(b.bw*zoom.scale);
+  stick.fy=0.5-zoom.ty/(b.bh*zoom.scale);
+}
+function exitZoom(remember=true){
+  if(remember) rememberZoom();                 // click-out / Z / navigation keep the level for next image
+  zoom.on=false; zoom.scale=1; zoom.tx=zoom.ty=0; zoom._b=null;
+  stage.classList.remove('zoom','grabbing');
+  photo.style.transform='';
+  $('minimap').hidden=true;
+}
+function toggleZoom(cx,cy){ zoom.on?exitZoom():enterZoom(cx,cy); }
+function zoomAt(px,py,ns){                     // anchor image point under (px,py) while scaling
+  const b=zoom._b; ns=Math.min(zoom.max,Math.max(1,ns));
+  if(ns<=1.001){ stick.scale=1; exitZoom(false); return; }  // scrolled fully out → stop sticky zoom
+  const u=(px-zoom.tx)/zoom.scale, v=(py-zoom.ty)/zoom.scale;
+  zoom.scale=ns; zoom.tx=px-u*ns; zoom.ty=py-v*ns;
+  applyZoom();
+}
+
+/* navigator: draw the viewport rectangle over the thumbnail */
+function drawMinimap(){
+  const b=zoom._b; if(!b) return;
+  const mm=$('minimap'), mw=mm.clientWidth, mh=mm.clientHeight;
+  if(!mw||!mh) return;
+  const dW=b.bw*zoom.scale, dH=b.bh*zoom.scale;
+  const left=b.sw/2+zoom.tx-dW/2, top=b.sh/2+zoom.ty-dH/2;
+  const fL=Math.max(0,(0-left)/dW),  fT=Math.max(0,(0-top)/dH);
+  const fR=Math.min(1,(b.sw-left)/dW), fB=Math.min(1,(b.sh-top)/dH);
+  const v=$('mmView');
+  v.style.left=(fL*mw)+'px'; v.style.top=(fT*mh)+'px';
+  v.style.width=((fR-fL)*mw)+'px'; v.style.height=((fB-fT)*mh)+'px';
+}
+function minimapTo(clientX,clientY){
+  const b=zoom._b; if(!b) return;
+  const r=$('minimap').getBoundingClientRect();
+  const gx=Math.min(1,Math.max(0,(clientX-r.left)/r.width));
+  const gy=Math.min(1,Math.max(0,(clientY-r.top)/r.height));
+  zoom.tx=b.bw*zoom.scale*(0.5-gx);            // centre the clicked fraction in the viewport
+  zoom.ty=b.bh*zoom.scale*(0.5-gy);
+  applyZoom();
+}
+
+/* One pointer model: press starts a potential drag; once it passes the move
+   threshold it's a real drag (zoom in first if needed, then pan as a hand
+   tool). A press that never moves is a click that toggles zoom. Deciding this
+   in pointerup — not a separate click event — avoids the click-synthesis
+   races that made dragging feel like "click, lock, then drift". */
+stage.addEventListener('pointerdown',e=>{
+  if(viewGrid||photo.hidden||!photo.naturalWidth||e.button!==0) return;
+  zoom.dragging=true; zoom.moved=false;
+  zoom.startX=e.clientX; zoom.startY=e.clientY;
+  zoom.startTx=zoom.tx; zoom.startTy=zoom.ty;
+  stage.setPointerCapture(e.pointerId);
+});
+stage.addEventListener('pointermove',e=>{
+  if(!zoom.dragging) return;
+  const dx=e.clientX-zoom.startX, dy=e.clientY-zoom.startY;
+  if(!zoom.moved && Math.abs(dx)+Math.abs(dy)>3){
+    zoom.moved=true;
+    if(!zoom.on){ enterZoom(zoom.startX,zoom.startY); zoom.startTx=zoom.tx; zoom.startTy=zoom.ty; }
+    stage.classList.add('grabbing');
+  }
+  if(zoom.moved && zoom.on){ zoom.tx=zoom.startTx+dx; zoom.ty=zoom.startTy+dy; applyZoom(); }
+});
+stage.addEventListener('pointerup',e=>{
+  if(!zoom.dragging) return;
+  zoom.dragging=false; stage.classList.remove('grabbing');
+  if(!zoom.moved){ zoom.on ? exitZoom() : enterZoom(e.clientX,e.clientY); }  // a click, not a drag
+});
+stage.addEventListener('pointercancel',()=>{ zoom.dragging=false; stage.classList.remove('grabbing'); });
+stage.addEventListener('dragstart',e=>e.preventDefault());   // belt-and-suspenders vs. native image drag
+
+/* Wheel: vertical scrolls the gallery (next/prev), horizontal zooms the photo. */
+let wheelAcc=0;
+stage.addEventListener('wheel',e=>{
+  if(viewGrid||photo.hidden) return;
+  e.preventDefault();
+  if(Math.abs(e.deltaX)>Math.abs(e.deltaY)){            // sideways wheel → zoom
+    if(!photo.naturalWidth) return;
+    const delta=e.deltaX;
+    if(!zoom.on){                                       // start from fit and grow gradually (no jump)
+      if(delta>=0) return;
+      beginZoom(); zoom.scale=1; zoom.tx=0; zoom.ty=0;
+    }
+    const r=stage.getBoundingClientRect();
+    zoomAt(e.clientX-r.left-zoom._b.sw/2, e.clientY-r.top-zoom._b.sh/2, zoom.scale*Math.exp(-delta*0.0006));
+  }else if(e.deltaY){                                   // vertical wheel → step through gallery
+    if(Math.sign(e.deltaY)!==Math.sign(wheelAcc)) wheelAcc=0;
+    wheelAcc+=e.deltaY;
+    if(Math.abs(wheelAcc)>=50){ show(cur+(wheelAcc>0?1:-1)); wheelAcc=0; }
+  }
+},{passive:false});
+
+/* navigator interactions — drag the box to pan, click to jump */
+let mmDrag=false;
+$('minimap').addEventListener('pointerdown',e=>{
+  e.stopPropagation(); e.preventDefault();
+  mmDrag=true; $('minimap').setPointerCapture(e.pointerId); minimapTo(e.clientX,e.clientY);
+});
+$('minimap').addEventListener('pointermove',e=>{ if(mmDrag) minimapTo(e.clientX,e.clientY); });
+$('minimap').addEventListener('pointerup',e=>{ mmDrag=false; e.stopPropagation(); });
+$('minimap').addEventListener('click',e=>e.stopPropagation());
+$('mmImg').addEventListener('load',drawMinimap);
+window.addEventListener('resize',()=>{ if(zoom.on){ zoom._b=zoomBase(); applyZoom(); } });
+
+/* ---------- destructive ops ---------- */
+async function ensureRW(){
+  const opt={mode:'readwrite'};
+  if(await dirHandle.queryPermission(opt)==='granted') return true;
+  return await dirHandle.requestPermission(opt)==='granted';
+}
+async function moveRejected(){
+  const rej=items.filter(x=>x.flag<0);
+  if(!rej.length) return;
+  if(!confirm(`Move ${rej.length} rejected file(s) into a "_rejected" subfolder?\nThis is reversible — files are not deleted.`)) return;
+  if(!await ensureRW()){ toast('Write permission denied'); return; }
+  const sub=await dirHandle.getDirectoryHandle('_rejected',{create:true});
+  let done=0;
+  for(const item of rej){
+    try{
+      const file=await item.handle.getFile();
+      const dest=await sub.getFileHandle(item.name,{create:true});
+      const w=await dest.createWritable(); await w.write(file); await w.close();
+      await item.parent.removeEntry(item.name);
+      if(item.url&&item.url!=='NONE') URL.revokeObjectURL(item.url);
+      done++;
+    }catch(e){ console.error(e); }
+  }
+  removeItems(rej);
+  toast(`Moved ${done} file(s) to _rejected/`);
+}
+async function deleteRejected(){
+  const rej=items.filter(x=>x.flag<0);
+  if(!rej.length) return;
+  if(!confirm(`Permanently delete ${rej.length} rejected file(s)?\nThis does NOT go to the Trash and cannot be undone.`)) return;
+  if(!await ensureRW()){ toast('Write permission denied'); return; }
+  let done=0;
+  for(const item of rej){
+    try{ await item.parent.removeEntry(item.name);
+      if(item.url&&item.url!=='NONE') URL.revokeObjectURL(item.url); done++;
+    }catch(e){ console.error(e); }
+  }
+  removeItems(rej);
+  toast(`Deleted ${done} file(s)`);
+}
+function removeItems(toRemove){
+  const set=new Set(toRemove);
+  const keep=cur;
+  allItems=allItems.filter(x=>!set.has(x));
+  buildFolderList();
+  if(!allItems.length){
+    items=[]; cur=0;
+    photo.hidden=true; $('meta').hidden=true; $('badge').hidden=true; $('flagbar').className='flagbar';
+    film.classList.add('hidden'); $('empty').hidden=false; $('sidebar').classList.add('hidden');
+    for(const b of ['btnGrid','btnMove','btnDel']) $(b).disabled=true;
+    updateCounts(); return;
+  }
+  // current folder may have emptied out — fall back to the first remaining one
+  const target=folders.some(f=>f.path===curFolder)?curFolder:folders[0].path;
+  selectFolder(target, keep);
+}
+
+/* ---------- toast ---------- */
+let toastT;
+function toast(msg){ const t=$('toast'); t.textContent=msg; t.classList.add('show');
+  clearTimeout(toastT); toastT=setTimeout(()=>t.classList.remove('show'),2400); }
+
+/* ---------- keyboard ---------- */
+window.addEventListener('keydown',e=>{
+  if($('help').classList.contains('open')&&e.key==='Escape'){ $('help').classList.remove('open'); return; }
+  if(!items.length) return;
+  switch(e.key.toLowerCase()){
+    case 'arrowright': show(cur+1); break;
+    case 'arrowleft':  show(cur-1); break;
+    case 'p': setFlag(1); break;
+    case 'x': setFlag(-1); break;
+    case 'u': case '0': setFlag(0); break;
+    case 'z': if(!viewGrid) toggleZoom(); break;
+    case ' ': if(!viewGrid){ e.preventDefault(); toggleZoom(); } break;
+    case 'g': toggleGrid(); break;
+    case 'escape':                              // Esc fully stops zoom (and the sticky carry-over)
+      if(zoom.on||stick.scale>1.001){ stick.scale=1; exitZoom(false); }
+      else if(viewGrid) toggleGrid();
+      break;
+    default: return;
+  }
+  if(['arrowleft','arrowright','p','x','u','0','g',' '].includes(e.key.toLowerCase())) e.preventDefault();
+});
+
+/* ---------- wire up ---------- */
+$('btnOpen').onclick=openFolder;
+$('btnOpen2').onclick=openFolder;
+$('btnGrid').onclick=toggleGrid;
+$('btnMove').onclick=moveRejected;
+$('btnDel').onclick=deleteRejected;
+$('btnHelp').onclick=()=>$('help').classList.add('open');
+$('btnCloseHelp').onclick=()=>$('help').classList.remove('open');
+$('help').onclick=e=>{ if(e.target===$('help')) $('help').classList.remove('open'); };
+</script>
+</body>
+</html>

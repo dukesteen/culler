@@ -464,6 +464,81 @@ function parseJpeg(buf,start){
   return null;
 }
 
+/* ---------- format-specific fast paths (Canon CR2 / CR3) ----------
+   These avoid pulling the whole 20–60 MB RAW into memory: they read a small
+   header to locate the embedded full-size JPEG preview, then slice just that.
+   Both fall back to the generic whole-file scan if anything looks off. */
+function indexOf4(b,s){                                  // find a 4-char box/atom tag
+  const a=s.charCodeAt(0),c=s.charCodeAt(1),d=s.charCodeAt(2),e=s.charCodeAt(3);
+  for(let i=0;i+3<b.length;i++) if(b[i]===a&&b[i+1]===c&&b[i+2]===d&&b[i+3]===e) return i;
+  return -1;
+}
+/* CR2 is TIFF: IFD0 holds the full-size JPEG preview (Compression=6) via
+   StripOffset/StripByteCount, and the orientation tag. */
+async function extractCR2(file){
+  const h=new Uint8Array(await file.slice(0,65536).arrayBuffer());
+  const le=h[0]===0x49;
+  if(!((h[0]===0x49&&h[1]===0x49&&h[2]===0x2A)||(h[0]===0x4D&&h[1]===0x4D&&h[3]===0x2A))) return null;
+  if(!(h[8]===0x43&&h[9]===0x52)) return null;           // "CR" magic at offset 8 → CR2
+  const u16=o=> le?(h[o]|h[o+1]<<8):(h[o]<<8|h[o+1]);
+  const u32=o=> le?((h[o]|h[o+1]<<8|h[o+2]<<16|h[o+3]<<24)>>>0):(((h[o]<<24|h[o+1]<<16|h[o+2]<<8|h[o+3])>>>0));
+  const ifd0=u32(4);
+  if(ifd0+2>h.length) return null;
+  const count=u16(ifd0);
+  if(ifd0+2+count*12>h.length) return null;
+  let orientation=1, comp=0, soff=0, slen=0;
+  for(let e=0;e<count;e++){
+    const ent=ifd0+2+e*12, tag=u16(ent);
+    if(tag===0x0103) comp=u16(ent+8);
+    else if(tag===0x0111) soff=u32(ent+8);
+    else if(tag===0x0117) slen=u32(ent+8);
+    else if(tag===0x0112){ const v=u16(ent+8); if(v>=1&&v<=8) orientation=v; }
+  }
+  if(comp!==6||!soff||!slen||soff+slen>file.size) return null;
+  const blob=file.slice(soff,soff+slen,'image/jpeg');
+  const sig=new Uint8Array(await blob.slice(0,2).arrayBuffer());
+  if(sig[0]!==0xFF||sig[1]!==0xD8) return null;          // must be a real JPEG, not the lossless RAW
+  return {blob,orientation};
+}
+/* CR3 is ISO-BMFF (MP4-like boxes): orientation lives in moov→…→CMT1 (a TIFF
+   block); the full preview JPEG lives in a top-level uuid box's PRVW atom. */
+async function extractCR3(file){
+  const size=file.size, moov=[], uuids=[];
+  let pos=0, guard=0;
+  while(pos+8<=size && guard++<64){
+    const dv=new DataView(await file.slice(pos,pos+16).arrayBuffer());
+    let bsize=dv.getUint32(0), hsize=8;
+    const type=String.fromCharCode(dv.getUint8(4),dv.getUint8(5),dv.getUint8(6),dv.getUint8(7));
+    if(bsize===1){ bsize=Number(dv.getBigUint64(8)); hsize=16; }
+    else if(bsize===0){ bsize=size-pos; }
+    if(bsize<hsize) break;
+    if(type==='moov') moov.push([pos+hsize, bsize-hsize]);
+    else if(type==='uuid') uuids.push([pos, bsize]);
+    pos+=bsize;
+  }
+  let orientation=1;
+  if(moov.length){
+    const [mo,ml]=moov[0];
+    const mb=new Uint8Array(await file.slice(mo,mo+Math.min(ml,1<<20)).arrayBuffer());
+    const ci=indexOf4(mb,'CMT1');
+    if(ci>=4){
+      const csize=(mb[ci-4]<<24|mb[ci-3]<<16|mb[ci-2]<<8|mb[ci-1])>>>0;
+      const end=csize>4?Math.min(mb.length,ci-4+csize):mb.length;
+      orientation=readExifOrientation(mb.subarray(ci+4,end));
+    }
+  }
+  for(const [uo,us] of uuids){
+    const ub=new Uint8Array(await file.slice(uo,uo+Math.min(us,8<<20)).arrayBuffer());
+    const pi=indexOf4(ub,'PRVW');
+    if(pi<0) continue;
+    let j=pi; while(j+2<ub.length && !(ub[j]===0xFF&&ub[j+1]===0xD8&&ub[j+2]===0xFF)) j++;
+    if(j+2>=ub.length) continue;
+    let k=j+2; while(k+1<ub.length && !(ub[k]===0xFF&&ub[k+1]===0xD9)) k++;
+    return {blob:new Blob([ub.subarray(j,Math.min(ub.length,k+2))],{type:'image/jpeg'}), orientation};
+  }
+  return null;
+}
+
 /* limit concurrent reads so a large grid doesn't pull every RAW into memory at once */
 let active=0; const waitQ=[];
 const gate =()=>active<3?(active++,Promise.resolve()):new Promise(r=>waitQ.push(()=>{active++;r();}));
@@ -480,11 +555,21 @@ async function ensureUrl(item){
         const head=new Uint8Array(await file.slice(0,262144).arrayBuffer());
         item.url=await orientToUrl(file, readExifOrientation(head));
       }else{
-        const buf=new Uint8Array(await file.arrayBuffer());
-        const jpg=findLargestJpeg(buf);
-        item.url = jpg
-          ? await orientToUrl(new Blob([buf.subarray(jpg.start,jpg.end)],{type:'image/jpeg'}), readExifOrientation(buf))
-          : 'NONE';                                            // big buffer is freed after this scope
+        const ext=item.name.split('.').pop().toLowerCase();
+        let fast=null;
+        try{
+          if(ext==='cr2') fast=await extractCR2(file);
+          else if(ext==='cr3') fast=await extractCR3(file);
+        }catch(e){ fast=null; }                                // any trouble → generic path
+        if(fast){
+          item.url=await orientToUrl(fast.blob, fast.orientation);
+        }else{
+          const buf=new Uint8Array(await file.arrayBuffer());  // generic: scan the whole file
+          const jpg=findLargestJpeg(buf);
+          item.url = jpg
+            ? await orientToUrl(new Blob([buf.subarray(jpg.start,jpg.end)],{type:'image/jpeg'}), readExifOrientation(buf))
+            : 'NONE';                                          // big buffer is freed after this scope
+        }
       }
     }catch(e){ item.url='NONE'; }
     finally{ ungate(); }

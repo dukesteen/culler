@@ -317,23 +317,37 @@ async function collect(handle, prefix){
   }
 }
 
+/* walk a JPEG's markers from `start` to the APP1/Exif TIFF header; -1 if none */
+function jpegExifTiff(b,start){
+  const n=b.length; let i=start+2;
+  while(i+4<n){
+    if(b[i]!==0xFF){ i++; continue; }
+    const m=b[i+1];
+    if(m===0xD9||m===0xDA) return -1;
+    const size=(b[i+2]<<8)|b[i+3];
+    if(m===0xE1&&b[i+4]===0x45&&b[i+5]===0x78&&b[i+6]===0x69&&b[i+7]===0x66&&b[i+8]===0&&b[i+9]===0) return i+10;
+    if(size<2) return -1;
+    i+=2+size;
+  }
+  return -1;
+}
+
 /* ---------- EXIF orientation (RAW previews drop the tag; re-apply it) ----------
-   Locates the TIFF/EXIF block (JPEG APP1, bare TIFF, or any embedded "Exif\0\0")
-   and reads IFD0 tag 0x0112. Returns 1..8, or 1 when absent/unparseable. */
+   Locates the TIFF/EXIF block (JPEG APP1, bare TIFF, Fujifilm RAF's embedded
+   JPEG, or any embedded "Exif\0\0") and reads IFD0 tag 0x0112. Returns 1..8,
+   or 1 when absent/unparseable. */
 function readExifOrientation(b){
   const n=b.length; let t=-1;
-  if(b[0]===0xFF&&b[1]===0xD8){                                   // JPEG: walk to APP1/Exif
-    let i=2;
-    while(i+4<n){
-      if(b[i]!==0xFF){ i++; continue; }
-      const m=b[i+1];
-      if(m===0xD9||m===0xDA) break;
-      const size=(b[i+2]<<8)|b[i+3];
-      if(m===0xE1&&b[i+4]===0x45&&b[i+5]===0x78&&b[i+6]===0x69&&b[i+7]===0x66&&b[i+8]===0&&b[i+9]===0){ t=i+10; break; }
-      if(size<2) break;
-      i+=2+size;
-    }
-  }else if((b[0]===0x49&&b[1]===0x49&&b[2]===0x2A&&b[3]===0)||(b[0]===0x4D&&b[1]===0x4D&&b[2]===0&&b[3]===0x2A)){
+  // Fujifilm RAF: a 16-byte "FUJIFILM…" magic, then a big-endian pointer at
+  // offset 84 to a full EXIF JPEG. Jump straight to it (RAF-only; no cost to
+  // other formats beyond this 4-byte magic check).
+  if(b[0]===0x46&&b[1]===0x55&&b[2]===0x4A&&b[3]===0x49){         // "FUJI"
+    const jo=((b[84]<<24)|(b[85]<<16)|(b[86]<<8)|b[87])>>>0;
+    if(jo>0&&jo+4<n&&b[jo]===0xFF&&b[jo+1]===0xD8) t=jpegExifTiff(b,jo);
+  }
+  if(t<0&&b[0]===0xFF&&b[1]===0xD8){                              // JPEG: walk to APP1/Exif
+    t=jpegExifTiff(b,0);
+  }else if(t<0&&((b[0]===0x49&&b[1]===0x49&&b[2]===0x2A&&b[3]===0)||(b[0]===0x4D&&b[1]===0x4D&&b[2]===0&&b[3]===0x2A))){
     t=0;                                                          // bare TIFF (most RAW)
   }
   if(t<0){                                                        // fallback: first Exif marker
@@ -394,13 +408,20 @@ async function displayUrl(item, baseUrl){
   const q=effectiveRot(item);
   if(!baseUrl || baseUrl==='NONE' || q===0){
     if(item._rot){ URL.revokeObjectURL(item._rot.url); item._rot=null; }   // back to upright
+    item._rotLoading=null;
     return baseUrl;
   }
   if(item._rot && item._rot.base===baseUrl && item._rot.q===q) return item._rot.url;
-  const url=await rotateUrl(baseUrl, q);
-  if(item._rot) URL.revokeObjectURL(item._rot.url);
-  item._rot={base:baseUrl, q, url};
-  return url;
+  if(item._rotLoading && item._rotLoading.q===q && item._rotLoading.base===baseUrl) return item._rotLoading.p;
+  const p=(async()=>{
+    const url=await rotateUrl(baseUrl, q);
+    if(item._rot) URL.revokeObjectURL(item._rot.url);
+    item._rot={base:baseUrl, q, url};
+    item._rotLoading=null;
+    return url;
+  })();
+  item._rotLoading={q, base:baseUrl, p};
+  return p;
 }
 
 /* ---------- embedded JPEG preview extraction (no external deps) ----------
@@ -552,8 +573,8 @@ function buildFilmstrip(){
   refreshAllThumbStates();
 }
 async function loadThumb(item,el){
-  const url=await ensureUrl(item);
-  if(url && url!=='NONE'){ const im=new Image(); im.src=url; el.innerHTML=''; el.appendChild(im); }
+  const url=await displayUrl(item, await ensureUrl(item));   // honours the orientation override
+  if(url && url!=='NONE'){ const im=new Image(); im.draggable=false; im.src=url; el.innerHTML=''; el.appendChild(im); }
 }
 function refreshThumbState(item){
   if(!item.el) return;
@@ -594,8 +615,8 @@ function buildGrid(){
   });
 }
 async function loadCell(item,c){
-  const url=await ensureUrl(item);
-  if(url&&url!=='NONE'){ const im=new Image(); im.src=url; c.insertBefore(im,c.firstChild); }
+  const url=await displayUrl(item, await ensureUrl(item));    // honours the orientation override
+  if(url&&url!=='NONE'){ const im=new Image(); im.draggable=false; im.src=url; c.insertBefore(im,c.firstChild); }
   refreshCellState(item);
 }
 function refreshCellState(item){
@@ -871,6 +892,7 @@ function rotate(dir){
   const item=items[cur];
   if(rotLock) rotLockVal=(rotLockVal+dir+4)%4;
   else item.rot=(((item.rot||0)+dir)%4+4)%4;
+  buildFilmstrip();           // re-render thumbnails at the new orientation
   show(cur);
 }
 function toggleRotLock(){
@@ -878,7 +900,7 @@ function toggleRotLock(){
   if(rotLock) rotLockVal=effectiveRot(items[cur]);   // adopt the current photo's rotation
   $('rotLock').textContent=rotLock?'🔒':'🔓';
   $('rotLock').classList.toggle('on',rotLock);
-  if(items.length) show(cur);
+  if(items.length){ buildFilmstrip(); show(cur); }
 }
 const orientEl=$('orient');
 orientEl.addEventListener('pointerdown',e=>e.stopPropagation());   // don't start a pan / toggle zoom
